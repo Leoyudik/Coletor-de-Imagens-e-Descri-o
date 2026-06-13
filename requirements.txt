@@ -1,0 +1,10 @@
+# HTTP requests e scraping
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2
+
+# Planilha Excel
+openpyxl==3.1.5
+
+# Browser automation (para sites com JavaScript como Panvel)
+playwright==1.44.0
