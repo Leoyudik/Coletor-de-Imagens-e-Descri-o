@@ -1,23 +1,28 @@
 """
 Automação para coleta de descrições e imagens de produtos farmacêuticos.
-Sites: Drogaria São Paulo (API VTEX) e Panvel (SPA Angular - usa Playwright)
+Sites: Drogaria São Paulo (API VTEX), Panvel (SPA Angular) e Beleza na Web (SPA - usa Playwright)
 """
 
 import os
 import re
+import html
 import json
 import time
 import hashlib
 import requests
 import openpyxl
+from io import BytesIO
 from pathlib import Path
+from PIL import Image
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+
 
 # ─── CONFIGURAÇÕES ────────────────────────────────────────────────────────────
 PLANILHA_ENTRADA   = "produtos.xlsx"  # <-- nome da sua planilha
 COLUNA_EAN         = "A"             # coluna com os EANs
 COLUNA_DESC_DSP    = "B"             # coluna Descrição Drogaria SP
 COLUNA_DESC_PANVEL = "C"             # coluna Descrição Panvel
+COLUNA_DESC_BLZ    = "D"             # coluna Descrição Beleza na Web   <-- NOVO
 PASTA_IMAGENS      = "imagens"       # pasta raiz para salvar imagens
 MAX_IMAGENS        = 10              # limite de imagens únicas por EAN
 
@@ -29,6 +34,7 @@ HEADERS = {
     ),
     "Accept-Language": "pt-BR,pt;q=0.9",
 }
+
 
 # ─── UTILITÁRIOS ──────────────────────────────────────────────────────────────
 
@@ -73,12 +79,31 @@ def salvar_imagens_unicas(ean: str, urls: list, session: requests.Session) -> in
         ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
         ext = ext if ext in {"jpg", "jpeg", "png", "webp", "gif"} else "jpg"
 
-        nome = pasta_ean / f"{ean} - {contador}.{ext}"
-        nome.write_bytes(conteudo)
-        print(f"    ✓ Salva: {nome.name}")
+        nome = pasta_ean / f"{ean}-{contador}.{ext}"
+        try:
+            img = Image.open(BytesIO(conteudo))
+            if img.mode in ("P", "RGBA", "LA"):
+                img = img.convert("RGBA").convert("RGB")
+            else:
+                img = img.convert("RGB")
+            img = img.resize((1000, 1000), Image.LANCZOS)
+            save_ext = "jpeg" if ext in {"jpg", "jpeg"} else ext
+            img.save(nome, format=save_ext.upper() if save_ext != "jpeg" else "JPEG")
+        except Exception as e:
+            print(f"    ⚠ Erro ao redimensionar, salvando original: {e}")
+            nome.write_bytes(conteudo)
+        print(f"    ✓ Salva (1000x1000): {nome.name}")
         contador += 1
 
     return contador - 1
+
+
+def limpar_html(texto: str) -> str:
+    if not texto:
+        return texto
+    texto = re.sub(r'<[^>]+>', '', texto)
+    texto = html.unescape(texto)
+    return re.sub(r'\s+', ' ', texto).strip()
 
 
 def col_letter_to_index(letter: str) -> int:
@@ -92,6 +117,7 @@ def col_letter_to_index(letter: str) -> int:
 # ─── DROGARIA SÃO PAULO (API VTEX) ────────────────────────────────────────────
 
 DSP_BASE = "https://www.drogariasaopaulo.com.br"
+
 
 def coletar_dsp(ean: str, session: requests.Session) -> tuple:
     """Usa a API VTEX nativa — rápido, sem JavaScript."""
@@ -128,12 +154,10 @@ def coletar_dsp(ean: str, session: requests.Session) -> tuple:
 
 PANVEL_BUSCA = "https://www.panvel.com/panvel/buscarProduto.do?termoPesquisa={ean}"
 
+
 def coletar_panvel(ean: str, page) -> tuple:
     """
     Usa Playwright para renderizar o JavaScript da Panvel.
-    Correção: wait_for_selector em script[type=ld+json] falha pois
-    <script> tags têm display:none e nunca são 'visíveis' para o Playwright.
-    Solução: esperar pelo h1.product-title (visível) e ler o JSON-LD depois.
     """
     print(f"  [Panvel] Buscando EAN {ean}...")
     try:
@@ -165,18 +189,15 @@ def coletar_panvel(ean: str, page) -> tuple:
         page.goto(produto_url, wait_until="domcontentloaded", timeout=30000)
 
         # Espera o h1 do produto ficar visível (confirma que a página carregou)
-        # CORREÇÃO: não esperar script[type="application/ld+json"] — tem display:none
         try:
             page.wait_for_selector("h1.product-title", state="visible", timeout=15000)
         except PwTimeout:
-            # fallback: esperar qualquer h1
             try:
                 page.wait_for_selector("h1", state="visible", timeout=10000)
             except PwTimeout:
                 print(f"  ⚠ Panvel: Página do produto demorou para carregar ({produto_url})")
 
-        # ── 4. Lê o JSON-LD diretamente do DOM (state="attached" = só precisa existir) ──
-        # <script> tags existem no DOM mas têm display:none — usar evaluate, não wait_for_selector
+        # ── 4. Lê o JSON-LD diretamente do DOM ─────────────────────────────
         ld_json_list = page.evaluate("""() => {
             const scripts = document.querySelectorAll('script[type="application/ld+json"]');
             return Array.from(scripts).map(el => {
@@ -195,7 +216,7 @@ def coletar_panvel(ean: str, page) -> tuple:
             print(f"  [Panvel] ✓ {nome} | {len(images)} imagens")
             return desc, images
 
-        # ── 5. Fallback: extrair do DOM caso JSON-LD não esteja disponível ─
+        # ── 5. Fallback: extrair do DOM ────────────────────────────────────
         titulo = page.locator("h1").first.text_content(timeout=5000).strip()
         imgs = page.evaluate("""() =>
             [...new Set(
@@ -210,6 +231,163 @@ def coletar_panvel(ean: str, page) -> tuple:
 
     except Exception as e:
         print(f"  ✗ Panvel: Erro para EAN {ean}: {e}")
+        return "", []
+
+
+# ─── BELEZA NA WEB (Playwright + bypass Akamai) ───────────────────────────────
+
+BLZ_BASE = "https://www.belezanaweb.com.br"
+
+def _blz_normalizar_url(url: str) -> str:
+    """
+    As imagens do Beleza na Web vêm do Cloudinary, mas o DOM entrega o caminho
+    de forma RELATIVA (ex: 'w_800/v1/imagens/product/...') ou absoluta.
+    Esta função:
+      1. Garante o domínio absoluto do Cloudinary.
+      2. Substitui a transformação de tamanho por uma de alta qualidade.
+    """
+    PREFIX = "https://res.cloudinary.com/beleza-na-web/image/upload/"
+    TRANSFORM = "w_1500,f_auto,fl_progressive,q_auto:best"
+
+    if not url:
+        return url
+
+    # Caso já seja absoluta (cloudinary), apenas troca a transformação
+    if url.startswith("http") and "res.cloudinary.com" in url and "/v1/" in url:
+        return re.sub(r"/upload/.*?/v1/", f"/upload/{TRANSFORM}/v1/", url)
+
+    # Caso seja relativa: pega só a partir de '/v1/' e remonta com prefixo + transform
+    if "/v1/" in url:
+        resto = "v1/" + url.split("/v1/", 1)[1]
+        return f"{PREFIX}{TRANSFORM}/{resto}"
+
+    # Fallback: se vier sem esquema mas com 'imagens/product', prefixa o domínio
+    if url.startswith("imagens/") or "/imagens/product/" in url:
+        caminho = url[url.index("imagens/"):] if "imagens/" in url else url
+        return f"{PREFIX}{TRANSFORM}/v1/{caminho}"
+
+    return url
+
+_blz_sessao_aquecida = {"ok": False}   # controla o "warm-up" da home (1x por execução)
+
+
+def _blz_aquecer_sessao(page):
+    """
+    O Akamai exige cookies de sensor (bm_sv, _abck, etc.) gerados ao visitar
+    a home com um navegador 'real'. Sem isso, /busca retorna 'Access Denied'.
+    Visita a home uma vez para estabelecer a sessão.
+    """
+    if _blz_sessao_aquecida["ok"]:
+        return
+    try:
+        page.goto(BLZ_BASE + "/", wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2500)   # dá tempo do Akamai injetar os cookies
+        _blz_sessao_aquecida["ok"] = True
+    except Exception as e:
+        print(f"  ⚠ BLZ: falha ao aquecer sessão: {e}")
+
+
+def coletar_belezanaweb(ean: str, page) -> tuple:
+    print(f"  [BLZ] Buscando EAN {ean}...")
+    try:
+        # ── 0. Aquece a sessão (home) antes de buscar ──────────────────────
+        _blz_aquecer_sessao(page)
+
+        # ── 1. Busca (redireciona para o produto se houver match) ──────────
+        page.goto(
+            f"{BLZ_BASE}/busca?q={ean}",
+            wait_until="domcontentloaded",
+            timeout=30000
+        )
+
+        # Detecta bloqueio do Akamai e tenta reaquecer 1x
+        if "Access Denied" in (page.title() or "") or "Access Denied" in page.content()[:500]:
+            print(f"  ⚠ BLZ: Akamai bloqueou — reaquecendo sessão e tentando de novo...")
+            _blz_sessao_aquecida["ok"] = False
+            _blz_aquecer_sessao(page)
+            page.wait_for_timeout(3000)
+            page.goto(f"{BLZ_BASE}/busca?q={ean}",
+                      wait_until="domcontentloaded", timeout=30000)
+            if "Access Denied" in (page.title() or ""):
+                print(f"  ✗ BLZ: Bloqueado pelo Akamai para EAN {ean}")
+                return "", []
+
+        # Se continuou na listagem, pega o primeiro produto
+        if "/busca" in page.url:
+            try:
+                page.wait_for_selector('a[href]', state="visible", timeout=8000)
+                link = page.evaluate("""() => {
+                    const a = Array.from(document.querySelectorAll('a[href]'))
+                        .map(e => e.getAttribute('href'))
+                        .find(h => h && /^\\/[a-z0-9-]+-\\d{3,}/i.test(h) && !h.includes('busca'));
+                    return a || null;
+                }""")
+            except PwTimeout:
+                link = None
+            if not link:
+                print(f"  – BLZ: Produto não encontrado para EAN {ean}")
+                return "", []
+            if link.startswith("/"):
+                link = BLZ_BASE + link
+            page.goto(link, wait_until="domcontentloaded", timeout=30000)
+
+        # ── 2. Espera o produto carregar ───────────────────────────────────
+        try:
+            page.wait_for_selector("h1", state="visible", timeout=15000)
+        except PwTimeout:
+            print(f"  ⚠ BLZ: Página demorou para carregar ({page.url})")
+
+        # ── 3. Extrai JSON-LD (ProductGroup) + imagens pelo SKU ────────────
+        dados = page.evaluate("""() => {
+            const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+            let pg = null;
+            for (const el of scripts) {
+                try {
+                    let d = JSON.parse(el.textContent);
+                    const arr = Array.isArray(d) ? d : [d];
+                    for (const it of arr) {
+                        if (it && (it['@type'] === 'ProductGroup' || it['@type'] === 'Product')) pg = it;
+                    }
+                } catch (e) {}
+            }
+            const sku = pg ? String(pg.sku || '') : '';
+            const desc = pg ? (pg.description || pg.name || '') : '';
+            const gtin = pg ? String(pg.gtin || pg.gtin13 || '') : '';
+            const found = new Set();
+            if (sku) {
+                document.querySelectorAll('img, source, a').forEach(el => {
+                    ['src','data-src','data-zoom-image','data-image','srcset','href'].forEach(attr => {
+                        const v = el.getAttribute && el.getAttribute(attr);
+                        if (v && v.includes('/imagens/product/' + sku + '/')) {
+                            v.split(',').forEach(part => {
+                                const u = part.trim().split(' ')[0];
+                                if (u.includes('/imagens/product/' + sku + '/')) found.add(u);
+                            });
+                        }
+                    });
+                });
+            }
+            if (pg && pg.image) (Array.isArray(pg.image) ? pg.image : [pg.image]).forEach(u => found.add(u));
+            const unique = new Map();
+            [...found].forEach(u => {
+                const m = u.match(/\\/product\\/\\d+\\/([a-f0-9]{8}-[a-f0-9-]+?)-[a-z]/i);
+                const key = m ? m[1] : u;
+                if (!unique.has(key)) unique.set(key, u);
+            });
+            return { sku, gtin, desc, imgs: [...unique.values()] };
+        }""")
+
+        if not dados or (not dados.get("desc") and not dados.get("imgs")):
+            print(f"  – BLZ: Sem dados para EAN {ean}")
+            return "", []
+
+        imgs = [_blz_normalizar_url(u) for u in dados.get("imgs", []) if u]
+        desc = dados.get("desc", "")
+        print(f"  [BLZ] ✓ SKU {dados.get('sku','')} | {len(imgs)} imagens")
+        return desc, imgs
+
+    except Exception as e:
+        print(f"  ✗ BLZ: Erro para EAN {ean}: {e}")
         return "", []
 
 
@@ -230,12 +408,15 @@ def processar_planilha():
     col_ean    = col_letter_to_index(COLUNA_EAN)
     col_dsp    = col_letter_to_index(COLUNA_DESC_DSP)
     col_panvel = col_letter_to_index(COLUNA_DESC_PANVEL)
+    col_blz    = col_letter_to_index(COLUNA_DESC_BLZ)   # <-- NOVO
 
     # Cabeçalhos (se vazios)
     if not ws.cell(row=1, column=col_dsp).value:
         ws.cell(row=1, column=col_dsp).value    = "Descrição Drogaria SP"
     if not ws.cell(row=1, column=col_panvel).value:
         ws.cell(row=1, column=col_panvel).value  = "Descrição Panvel"
+    if not ws.cell(row=1, column=col_blz).value:                      # <-- NOVO
+        ws.cell(row=1, column=col_blz).value     = "Descrição Beleza na Web"
 
     # Coleta os EANs
     eans = []
@@ -251,11 +432,24 @@ def processar_planilha():
 
     # Inicia o Playwright (um browser para todos os EANs — mais eficiente)
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=False)  # mude para False para ver o browser
+        # headless=False ajuda MUITO contra o Akamai. Se precisar rodar sem tela,
+        # use headless=True com o pacote 'playwright-stealth' (ver nota abaixo).
+        browser = pw.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
+        )
         context = browser.new_context(
             user_agent=HEADERS["User-Agent"],
             locale="pt-BR",
-            viewport={"width": 1280, "height": 800}
+            viewport={"width": 1366, "height": 768},
+            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
+        )
+        # Remove o sinal navigator.webdriver=true que o Akamai detecta
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = context.new_page()
 
@@ -265,14 +459,18 @@ def processar_planilha():
 
             # ── Drogaria São Paulo ─────────────────────────────────────────
             desc_dsp, imgs_dsp = coletar_dsp(ean, http_session)
-            ws.cell(row=row_num, column=col_dsp).value = desc_dsp
+            ws.cell(row=row_num, column=col_dsp).value = limpar_html(desc_dsp)
 
             # ── Panvel ────────────────────────────────────────────────────
             desc_panvel, imgs_panvel = coletar_panvel(ean, page)
-            ws.cell(row=row_num, column=col_panvel).value = desc_panvel
+            ws.cell(row=row_num, column=col_panvel).value = limpar_html(desc_panvel)
 
-            # ── Imagens (DSP + Panvel, sem duplicatas, max 10) ────────────
-            todas_urls = list(dict.fromkeys(imgs_dsp + imgs_panvel))  # deduplicar por URL
+            # ── Beleza na Web ─────────────────────────────────────────────  <-- NOVO
+            desc_blz, imgs_blz = coletar_belezanaweb(ean, page)
+            ws.cell(row=row_num, column=col_blz).value = limpar_html(desc_blz)
+
+            # ── Imagens (DSP + Panvel + BLZ, sem duplicatas, max 10) ──────
+            todas_urls = list(dict.fromkeys(imgs_dsp + imgs_panvel + imgs_blz))  # dedup por URL
             if todas_urls:
                 print(f"\n  📥 Baixando imagens ({len(todas_urls)} URLs únicas)...")
                 total = salvar_imagens_unicas(ean, todas_urls, http_session)
@@ -294,4 +492,3 @@ def processar_planilha():
 
 if __name__ == "__main__":
     processar_planilha()
-    
